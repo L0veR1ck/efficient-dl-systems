@@ -130,3 +130,10 @@ dmypy.json
 
 .idea
 .DS_Store
+
+*__pycache__
+*__MACOSX
+
+week02_fast_pipelines/homework/task2/wikitext-103-raw-v1
+week02_fast_pipelines/homework/task2/train
+week02_fast_pipelines/homework/task2/train_masks
