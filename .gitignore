@@ -135,5 +135,5 @@ dmypy.json
 *__MACOSX
 
 week02_fast_pipelines/homework/task2/wikitext-103-raw-v1
-week02_fast_pipelines/homework/task2/train
-week02_fast_pipelines/homework/task2/train_masks
+week02_fast_pipelines/homework/task1/train
+week02_fast_pipelines/homework/task1/train_masks
