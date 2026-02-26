@@ -1,0 +1,22 @@
+[project]
+name = "week04-large-models"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate==0.32.1",
+    "datasets==2.20.0",
+    "jupyter>=1.1.1",
+    "peft>=0.18.1",
+    "torch>=2.10.0",
+    "transformers==4.46.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
