@@ -80,7 +80,10 @@ class FSDPParam:
         shard_world_size = self.mesh.size()
 
         assert param.size(shard_dim) % shard_world_size == 0
+
         # TODO(task1): shard the full `param` into `sharded_param`
+        sharded_param = param.chunk(shard_world_size, dim=shard_dim)[shard_rank]
+
         self.sharded_size = sharded_param.size()
         self.sharded_param = nn.Parameter(
             self.to_sharded_dtensor(sharded_param),
@@ -271,6 +274,8 @@ class FSDPModule:
             return  # no-op
         with record_function(self.with_fqn("FSDP::all_gather")):
             # TODO(task1): gather the parameters shards (cast to `param_dtype`) for each parameter
+            param_all_gather_outputs = []
+            torch.distributed.all_gather_into_tensor(param_all_gather_outputs, ...)
             self._all_gather_result = AllGatherResult(
                 param_all_gather_outputs=param_all_gather_outputs,
             )
