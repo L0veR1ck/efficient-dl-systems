@@ -277,22 +277,26 @@ class FSDPModule:
                 )
                 for param in self.fsdp_params
             ]
-            self._all_gather_result = AllGatherResult(
-                param_all_gather_outputs=param_all_gather_outputs,
-            )
-            # TODO(task2): create an event which marks the end of all-gather
-            # and save it in `AllGatherResult`
+
+        # TODO(task2): create an event which marks the end of all-gather
+        # and save it in `AllGatherResult`
+        assert self.comm_ctx.device_handle is not None
+        with self.comm_ctx.device_handle.stream(self.comm_ctx.all_gather_stream):
+            all_gather_event = self.comm_ctx.device_handle.Event()
+
+        self._all_gather_result = AllGatherResult(param_all_gather_outputs, all_gather_event)
 
     def wait_for_unshard(self):
         # TODO(task2): wait for the end of the all-gather launched by `unshard`
+        assert self._all_gather_result is not None
+        self.comm_ctx.all_gather_stream.wait_event(self._all_gather_result.all_gather_event)
+
         # TODO(task1): for each parameter:
         #   - allocate its unsharded paramter
         #   - copy the all-gather output into it
         #   - assign the unsharded parameter into the module (call `.to_unsharded()`)
         # then free the `all_gather_result`
         # NOTE: copy to the `.data` attribute
-        assert self._all_gather_result is not None
-
         for param, all_gather_output in zip(self.fsdp_params, self._all_gather_result.param_all_gather_outputs):
             param.alloc_unsharded_param()
             param.unsharded_param.data.copy_(all_gather_output)
@@ -300,8 +304,10 @@ class FSDPModule:
 
         self._all_gather_result = None
         self._sharded_state = ShardedState.UNSHARDED
+
         # TODO(task2): block all-gather stream until copy is complete,
         # so it doesn't interfere with the next unshard
+        self.comm_ctx.all_gather_stream.synchronize()
 
     def reshard(self):
         # TODO(bonus1): do nothing if called during forward adn self._reshard_after_forward is True
