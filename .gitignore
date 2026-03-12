@@ -137,3 +137,6 @@ dmypy.json
 week02_fast_pipelines/homework/task2/wikitext-103-raw-v1
 week02_fast_pipelines/homework/task1/train
 week02_fast_pipelines/homework/task1/train_masks
+week05_fsdp/homework/artifacts
+week05_fsdp/homework/c4_test
+week05_fsdp/homework/tokenizer

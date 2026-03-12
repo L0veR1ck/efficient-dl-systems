@@ -17,6 +17,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 logger = logging.getLogger(__name__)
+torch.use_deterministic_algorithms(True)
 
 
 cls_to_fsdp_cls: dict[type, type] = {}
@@ -133,9 +134,7 @@ class FSDPParam:
 
     def to_sharded_dtensor(self, tensor: torch.Tensor) -> DTensor:
         if tensor.shape != self.sharded_size:
-            raise AssertionError(
-                f"Expects size {self.sharded_size} but got {tensor.shape}."
-            )
+            raise AssertionError(f"Expects size {self.sharded_size} but got {tensor.shape}.")
         return DTensor.from_local(
             tensor,
             self._sharding_spec.mesh,
@@ -168,9 +167,7 @@ def free_storage(tensor: torch.Tensor) -> None:
 # NOTE: These bypass `nn.Module.__setattr__` checks, which incur non-trivial
 # CPU overhead, if the module did not override it. For FSDP, we know we do not
 # need those checks when transitioning between sharded/unsharded parameters.
-def unsafe_setattr_param(
-    module: nn.Module, param_name: str, param: nn.Parameter
-) -> None:
+def unsafe_setattr_param(module: nn.Module, param_name: str, param: nn.Parameter) -> None:
     if getattr(module.__setattr__, "__func__", None) is nn.Module.__setattr__:
         module._parameters[param_name] = param
     else:  # slow path
@@ -282,7 +279,7 @@ class FSDPModule:
                 )
                 .redistribute(
                     placements=[Replicate()],
-                    # async_op=True,
+                    async_op=True,
                 )
                 .to_local()
                 for param in self.fsdp_params
@@ -290,23 +287,23 @@ class FSDPModule:
 
         # TODO(task2): create an event which marks the end of all-gather
         # and save it in `AllGatherResult`
-        #
-        # assert self.comm_ctx.device_handle is not None
-        # with self.comm_ctx.device_handle.stream(self.comm_ctx.all_gather_stream):
-        #     all_gather_event = self.comm_ctx.device_handle.Event()
+        assert self.comm_ctx.device_handle is not None
+        with self.comm_ctx.device_handle.stream(self.comm_ctx.all_gather_stream):
+            all_gather_event = self.comm_ctx.device_handle.Event()
+            all_gather_event.record(self.comm_ctx.all_gather_stream)
 
         self._all_gather_result = AllGatherResult(
             param_all_gather_outputs,
-            # all_gather_event,
+            all_gather_event,
         )
 
     def wait_for_unshard(self):
-        # TODO(task2): wait for the end of the all-gather launched by `unshard`
-        assert self._all_gather_result is not None
+        all_gather_result = self._all_gather_result
+        if all_gather_result is None:
+            return
 
-        # self.comm_ctx.all_gather_stream.wait_event(
-        #     self._all_gather_result.all_gather_event
-        # )
+        # TODO(task2): wait for the end of the all-gather launched by `unshard`
+        self.comm_ctx.all_gather_stream.wait_event(all_gather_result.all_gather_event)
 
         # TODO(task1): for each parameter:
         #   - allocate its unsharded paramter
@@ -314,9 +311,7 @@ class FSDPModule:
         #   - assign the unsharded parameter into the module (call `.to_unsharded()`)
         # then free the `all_gather_result`
         # NOTE: copy to the `.data` attribute
-        for param, all_gather_output in zip(
-            self.fsdp_params, self._all_gather_result.param_all_gather_outputs
-        ):
+        for param, all_gather_output in zip(self.fsdp_params, all_gather_result.param_all_gather_outputs):
             param.alloc_unsharded_param()
             param.unsharded_param.data.copy_(all_gather_output)
             param.to_unsharded()
@@ -326,14 +321,17 @@ class FSDPModule:
 
         # TODO(task2): block all-gather stream until copy is complete,
         # so it doesn't interfere with the next unshard
-        #
-        # self.comm_ctx.all_gather_stream.synchronize()
+        self.comm_ctx.all_gather_stream.synchronize()
 
     def reshard(self):
         # TODO(bonus1): do nothing if called during forward adn self._reshard_after_forward is True
         # TODO(task1): for each parameter:
         #   - free the unsharded parameter
         #   - assign the sharded parameter into the module (call `.to_sharded()`)
+        assert self._training_state in (TrainingState.FORWARD, TrainingState.POST_BACKWARD)
+        if self._training_state == TrainingState.FORWARD and not self._reshard_after_forward:
+            return
+
         for param in self.fsdp_params:
             param.free_unsharded_param()
             param.to_sharded()
@@ -363,14 +361,15 @@ class FSDPModule:
     def _backward_prefetch(self) -> None:
         # TODO(task3): using `self._post_forward_indices` and `self.comm_ctx.post_forward_order`
         # find the right FSDPModule to prefetch
-        self._prefetch_unshard(target_fsdp_module)
+        idx_to_prefetch = self._post_forward_indices.pop() - 1
+        if idx_to_prefetch >= 0:
+            target_fsdp_module = self.comm_ctx.post_forward_order[idx_to_prefetch]
+            self._prefetch_unshard(target_fsdp_module)
 
     @staticmethod
     def _prefetch_unshard(target_fsdp_module: "FSDPModule") -> None:
         with (
-            record_function(
-                f"FSDP::backward_prefetch for {target_fsdp_module._module_fqn}"
-            ),
+            record_function(f"FSDP::backward_prefetch for {target_fsdp_module._module_fqn}"),
             target_fsdp_module.use_training_state(TrainingState.PRE_BACKWARD),
         ):
             target_fsdp_module.unshard()
@@ -419,8 +418,8 @@ def pre_backward(module: FSDPModule, grad: torch.Tensor):
         module._training_state = TrainingState.PRE_BACKWARD
         module.unshard()  # no-op if prefetched
         module.wait_for_unshard()
-        # module._backward_prefetch()
         # TODO(task3): uncomment the next line
+        module._backward_prefetch()
     return grad
 
 
@@ -434,38 +433,57 @@ def post_backward(module: FSDPModule):
     # TODO(bonus2): reshard the module only if module.reshard_after_backward is True
     # TODO(bonus3): reduce the grads only if module.reduce_grads is True
     with record_function(module.with_fqn("FSDP::post_backward_reduce")):
+        comm_ctx = module.comm_ctx
+        assert comm_ctx.device_handle is not None
+
+        reduce_scatter_stream = comm_ctx.reduce_scatter_stream
+        current_stream = comm_ctx.device_handle.current_stream()
+
         # TODO(task3): allocate the inputs for the reduce-scatter in the reduce-scatter stream
         # NOTE:
         #   - you should wait for the current stream to finish its backward pass
         #   - you should copy the grads into some memory allocated in the reduce-scatter stream
         #     so it doesn't interfere with the next backward
-        # TODO(task1):
-        #   - cast the parameter gradients to reduce dtype
-        #   - delete the unsharded parameter grad
-        for param in module.fsdp_params:
-            unsharded_grad = param.unsharded_param.grad
-            assert unsharded_grad is not None
+        reduce_scatter_stream.wait_stream(current_stream)
+        with comm_ctx.device_handle.stream(reduce_scatter_stream):
+            buffer = []
+            for param in module.fsdp_params:
+                unsharded_grad = param.unsharded_param.grad
+                assert unsharded_grad is not None
 
-            param.unsharded_param.grad = None
+                # TODO(task1):
+                #   - cast the parameter gradients to reduce dtype
+                #   - delete the unsharded parameter grad
+                grad_copy = torch.empty_like(unsharded_grad)
+                grad_copy.copy_(unsharded_grad, non_blocking=True)
+                grad_copy = grad_copy.to(param.reduce_dtype or param.param_dtype or param.orig_dtype)
 
-            # TODO(task3): now block current stream until reduce-scatter stream finishes the copy
-            # TODO(task1): reduce-scatter the gradients and assign the reduced grad shards to `sharded_param.grad`s
-            # (casting them to `orig_dtype`)
-            param.sharded_param.grad = (
-                DTensor.from_local(
-                    unsharded_grad.to(
-                        param.reduce_dtype or param.param_dtype or param.orig_dtype
-                    ),
-                    device_mesh=param.mesh,
-                    placements=[Partial(reduce_op="avg")],
+                param.unsharded_param.grad = None
+                buffer.append((param, grad_copy))
+
+        # TODO(task3): now block current stream until reduce-scatter stream finishes the copy
+        current_stream.wait_stream(reduce_scatter_stream)
+
+        # TODO(task1): reduce-scatter the gradients and assign the reduced grad shards to `sharded_param.grad`s
+        # (casting them to `orig_dtype`)
+        with comm_ctx.device_handle.stream(reduce_scatter_stream):
+            for param, grad_copy in buffer:
+                param.sharded_param.grad = (
+                    DTensor.from_local(
+                        grad_copy,
+                        device_mesh=param.mesh,
+                        placements=[Partial(reduce_op="avg")],
+                    )
+                    .redistribute(placements=[Shard(0)])
+                    .to(param.orig_dtype)
                 )
-                .redistribute(placements=[Shard(0)])
-                .to(param.orig_dtype)
-            )
 
         # TODO(task3): create an event which marks the end of the reduce-scatter
         # and save it to `_post_reduce_event` to wait for it
         # when the whole backward finishes (in the final callback)
+        event = comm_ctx.device_handle.Event()
+        event.record(reduce_scatter_stream)
+        module._post_reduce_event = event
 
 
 def register_pre_backward_hook(hook: Callable, output: Any) -> Any:
@@ -506,9 +524,7 @@ def register_post_backward_hook(
 
 class RegisterPostBackwardFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
-        ctx, module: FSDPModule, *inputs: torch.Tensor
-    ) -> tuple[torch.Tensor, ...]:
+    def forward(ctx, module: FSDPModule, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
         # All tensors in `inputs` should require gradient
         ctx.module = module
         return inputs
