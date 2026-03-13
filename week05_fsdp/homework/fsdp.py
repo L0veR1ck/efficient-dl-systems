@@ -270,27 +270,31 @@ class FSDPModule:
             return
         if self._sharded_state == ShardedState.UNSHARDED:
             return  # no-op
-        with record_function(self.with_fqn("FSDP::all_gather")):
-            # TODO(task1): gather the parameters shards (cast to `param_dtype`) for each parameter
-            param_all_gather_outputs = [
-                cast(
-                    DTensor,
-                    param.sharded_param.data.to(param.param_dtype or param.orig_dtype),
-                )
-                .redistribute(
-                    placements=[Replicate()],
-                    async_op=True,
-                )
-                .to_local()
-                for param in self.fsdp_params
-            ]
 
-        # TODO(task2): create an event which marks the end of all-gather
-        # and save it in `AllGatherResult`
-        assert self.comm_ctx.device_handle is not None
-        with self.comm_ctx.device_handle.stream(self.comm_ctx.all_gather_stream):
-            all_gather_event = self.comm_ctx.device_handle.Event()
-            all_gather_event.record(self.comm_ctx.all_gather_stream)
+        device_handle = self.comm_ctx.device_handle
+        assert device_handle is not None
+
+        all_gather_stream = self.comm_ctx.all_gather_stream
+        with device_handle.stream(all_gather_stream):
+            with record_function(self.with_fqn("FSDP::all_gather")):
+                # TODO(task1): gather the parameters shards (cast to `param_dtype`) for each parameter
+                param_all_gather_outputs = [
+                    cast(
+                        DTensor,
+                        param.sharded_param.data.to(param.param_dtype or param.orig_dtype),
+                    )
+                    .redistribute(
+                        placements=[Replicate()],
+                        async_op=True,
+                    )
+                    .to_local()
+                    for param in self.fsdp_params
+                ]
+
+            # TODO(task2): create an event which marks the end of all-gather
+            # and save it in `AllGatherResult`
+            all_gather_event = device_handle.Event()
+            all_gather_event.record(all_gather_stream)
 
         self._all_gather_result = AllGatherResult(
             param_all_gather_outputs,
@@ -301,6 +305,11 @@ class FSDPModule:
         all_gather_result = self._all_gather_result
         if all_gather_result is None:
             return
+
+        device_handle = self.comm_ctx.device_handle
+        assert device_handle is not None
+
+        all_gather_stream = self.comm_ctx.all_gather_stream
 
         # TODO(task2): wait for the end of the all-gather launched by `unshard`
         self.comm_ctx.all_gather_stream.wait_event(all_gather_result.all_gather_event)
@@ -313,15 +322,15 @@ class FSDPModule:
         # NOTE: copy to the `.data` attribute
         for param, all_gather_output in zip(self.fsdp_params, all_gather_result.param_all_gather_outputs):
             param.alloc_unsharded_param()
-            param.unsharded_param.data.copy_(all_gather_output)
+            param.unsharded_param.data.copy_(all_gather_output, non_blocking=True)
             param.to_unsharded()
-
-        self._all_gather_result = None
-        self._sharded_state = ShardedState.UNSHARDED
 
         # TODO(task2): block all-gather stream until copy is complete,
         # so it doesn't interfere with the next unshard
-        self.comm_ctx.all_gather_stream.synchronize()
+        all_gather_stream.wait_stream(device_handle.current_stream())
+
+        self._all_gather_result = None
+        self._sharded_state = ShardedState.UNSHARDED
 
     def reshard(self):
         # TODO(bonus1): do nothing if called during forward adn self._reshard_after_forward is True
