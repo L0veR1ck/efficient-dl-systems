@@ -3,29 +3,17 @@ import logging
 import os
 import pathlib
 import pickle
-from typing import Any, Literal
+from typing import Any
+from typing import Literal
 
 import torch
 import tyro
-from fsdp import (
-    FSDPCommContext,
-)
-from fsdp import (
-    FSDPModule as EffdlFSDPModule,
-)
-from fsdp import (
-    fully_shard as effdl_fully_shard,
-)
 from torch.distributed._functional_collectives import all_reduce
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import (
-    FSDPModule as FSDP2Module,
-)
-from torch.distributed.fsdp import (
-    MixedPrecisionPolicy,
-)
-from torch.distributed.fsdp import (
     fully_shard as fsdp2_fully_shard,
+    MixedPrecisionPolicy,
+    FSDPModule as FSDP2Module,
 )
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchtitan.components.loss import cross_entropy_loss
@@ -33,6 +21,12 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataset
 from torchtitan.models.llama3.model.args import TransformerModelArgs
 from torchtitan.models.llama3.model.model import Transformer
+
+from fsdp import (
+    fully_shard as effdl_fully_shard,
+    FSDPCommContext,
+    FSDPModule as EffdlFSDPModule,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,7 +127,9 @@ def build_dataloader(seq_len: int, batch_size: int = 1) -> StatefulDataLoader:
 
 
 def trace_handler(prof: Any, traces_dir: pathlib.Path):
-    prof.export_chrome_trace(str(traces_dir / f"rank{torch.distributed.get_rank()}.json"))
+    prof.export_chrome_trace(
+        str(traces_dir / f"rank{torch.distributed.get_rank()}.json")
+    )
 
 
 def train(
@@ -153,7 +149,9 @@ def train(
     reduce_grads_before_last_backward: bool = True,
 ) -> tuple[list[float], list[float]]:
     if fsdp is not None:
-        dp_mesh = init_device_mesh("cuda", mesh_shape=(torch.distributed.get_world_size(),))
+        dp_mesh = init_device_mesh(
+            "cuda", mesh_shape=(torch.distributed.get_world_size(),)
+        )
         torch.distributed.tensor._random.manual_seed(42, dp_mesh)
     if num_steps_to_profile is not None:
         torch.cuda.memory._record_memory_history()
@@ -180,7 +178,9 @@ def train(
         )
     logger.info(f"model size: {sum(p.numel() for p in model.parameters())} parameters.")
     param_dtype = STR_TO_TORCH_DTYPE[param_dtype] if param_dtype is not None else None
-    reduce_dtype = STR_TO_TORCH_DTYPE[reduce_dtype] if reduce_dtype is not None else None
+    reduce_dtype = (
+        STR_TO_TORCH_DTYPE[reduce_dtype] if reduce_dtype is not None else None
+    )
     if fsdp == "fsdp2":
         apply_fsdp2(
             model,
@@ -248,7 +248,9 @@ def train(
             grad_norm = grad_norm.full_tensor()
         optimizer.step()
         optimizer.zero_grad()
-        logger.info(f"step: {step:2}  loss: {loss.item():7.4f}  grad_norm: {grad_norm.item():7.4f}")
+        logger.info(
+            f"step: {step:2}  loss: {loss.item():7.4f}  grad_norm: {grad_norm.item():7.4f}"
+        )
         losses.append(loss.item())
         grad_norms.append(grad_norm.item())
         if num_steps_to_profile is not None and step == num_steps_to_profile:
